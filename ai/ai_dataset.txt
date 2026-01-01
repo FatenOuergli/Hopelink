@@ -1,0 +1,158 @@
+import pandas as pd
+import numpy as np
+import random
+
+# Configuration
+np.random.seed(42)
+random.seed(42)
+
+NUM_PATIENTS = 80
+ACTIVITY_INSTANCES = 20
+
+# Value sets
+genders = ["Male", "Female"]
+conditions = ["Anxiety", "PTSD", "Depression", "Bipolar", "Post-COVID"]
+diag_labels = ["GAD", "PTSD", "Depression", "Bipolar", "Post-COVID"]
+doctor_flags = ["flag1", "flag2", "flag3"]
+activity_types = ["cognitive", "relaxation", "sport"]
+
+# Generate patients
+demographics = []
+for pid in range(100, 100 + NUM_PATIENTS):
+    gender = random.choice(genders)
+    condition = random.choice(conditions)
+    diag = random.choice(diag_labels)
+    demographics.append([pid, gender, condition, diag])
+
+df_patients = pd.DataFrame(demographics, columns=[
+    "patient_id", "gender", "condition_type", "diagnostic_label"
+])
+
+# Generate dataset rows
+rows = []
+activity_id = 0
+
+for _, pat in df_patients.iterrows():
+    for _ in range(ACTIVITY_INSTANCES):
+        activity_id += 1
+        activity_type = random.choice(activity_types)
+        progress_duration = random.choice([10, 15, 20, 30])
+        assigned_duration = random.choice([10, 15, 20, 30])
+
+        # Static feature logic for "sport"
+        if activity_type == "sport":
+            age = np.random.randint(18, 70)
+            if age < 30:
+                correctness = 0 if np.random.randint(100) < 70 else 1
+            elif age > 55:
+                correctness = 3 if np.random.randint(100) < 70 else 2
+            else:
+                correctness = 2
+
+            if correctness <= 1:
+                severity_score = np.random.randint(4, 6)
+            elif correctness >= 3:
+                severity_score = np.random.randint(1, 3)
+            else:
+                severity_score = np.random.randint(2, 5)
+        else:
+            age = np.random.randint(18, 70)
+            severity_score = np.random.randint(1, 6)
+            correctness = random.choices([0, 1, 2, 3, 4], weights=[1, 2, 3, 2, 1])[0]
+
+        # Heart rate logic
+        if activity_type == "cognitive":
+            hr = np.random.randint(60, 70) if correctness >= 2 and np.random.randint(100) < 90 else np.random.randint(70, 120)
+            if correctness < 2:
+                hr = np.random.randint(80, 140)
+        elif activity_type == "relaxation":
+            hr = np.random.randint(60, 70) if correctness >= 2 else np.random.randint(70, 120)
+        elif activity_type == "sport":
+            hr = np.random.randint(70, 100) if correctness >= 2 else (
+                np.random.randint(100, 140) if np.random.randint(100) < 50 else np.random.randint(60, 70)
+            )
+
+        acc = np.random.uniform(-1, 1, 3)
+        gyro = np.random.uniform(-1, 1, 3)
+
+        for _ in range(progress_duration):
+            hr += np.random.randint(-1, 1)
+
+            # Dynamic sensor variation
+            if activity_type == "cognitive":
+                if correctness >= 2:
+                    acc += np.random.uniform(-0.01, 0.01, 3) if np.random.randint(100) < 80 else np.random.uniform(-0.05, 0.05, 3)
+                    gyro += np.random.uniform(-0.01, 0.01, 3) if np.random.randint(100) < 80 else np.random.uniform(-0.05, 0.05, 3)
+                else:
+                    acc += np.random.uniform(-0.05, 0.05, 3)
+                    gyro += np.random.uniform(-0.05, 0.05, 3)
+
+            elif activity_type == "relaxation":
+                if correctness >= 2:
+                    acc += np.random.uniform(-0.01, 0.01, 3)
+                    gyro += np.random.uniform(-0.01, 0.01, 3)
+                else:
+                    acc += np.random.uniform(-0.05, 0.05, 3)
+                    gyro += np.random.uniform(-0.05, 0.05, 3)
+
+            elif activity_type == "sport":
+                acc += np.random.uniform(-0.05, 0.05, 3)
+                gyro += np.random.uniform(-0.05, 0.05, 3)
+
+            acc_magnitude = np.linalg.norm(acc)
+            hr_variance = np.random.uniform(0.5, 1.5)
+            duration_ratio = progress_duration / assigned_duration
+            duration_diff = progress_duration - assigned_duration
+            flags = [0 if np.random.randint(100) < (90 - 20 * correctness) else 1 for _ in doctor_flags]
+            flag_sum = sum(flags)
+
+            if correctness <= 1:
+                feedback = np.random.randint(0, 2)
+            elif correctness <= 3:
+                feedback = np.random.randint(1, 3)
+            else:
+                feedback = np.random.randint(3, 5)
+
+            rows.append({
+                "activity_id": activity_id,
+                "patient_id": pat.patient_id,
+                "activity_type": activity_type,
+                "age": age,
+                "gender": pat.gender,
+                "condition_type": pat.condition_type,
+                "diagnostic_label": pat.diagnostic_label,
+                "severity_score": severity_score,
+                "feedback": feedback,
+                "assigned_duration": assigned_duration,
+                "progress_duration": progress_duration,
+                "duration_ratio": duration_ratio,
+                "duration_diff": duration_diff,
+                "flag1": flags[0],
+                "flag2": flags[1],
+                "flag3": flags[2],
+                "flag_sum": flag_sum,
+                "heart_rate": hr,
+                "hr_variance": hr_variance,
+                "acc_x": acc[0],
+                "acc_y": acc[1],
+                "acc_z": acc[2],
+                "acc_magnitude": acc_magnitude,
+                "gyro_x": gyro[0],
+                "gyro_y": gyro[1],
+                "gyro_z": gyro[2],
+                "correctness": correctness
+            })
+
+# Save final dataset
+df = pd.DataFrame(rows)
+df.to_csv("hopelink_psych_therapy_dataset.csv", index=False)
+print(f"✅ Dataset saved to hopelink_psych_therapy_dataset.csv with shape {df.shape}")
+from google.colab import files
+
+# Path to the file you want to download
+file_path = '/content/hopelink_psych_therapy_dataset.csv'
+
+
+
+# Trigger the download
+files.download(file_path)

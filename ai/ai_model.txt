@@ -1,0 +1,268 @@
+!pip install --no-cache-dir \
+    numpy==1.26.4 \
+    pandas==1.5.3 \
+    tensorflow==2.18.0 \
+    tensorflow-text==2.18.1 \
+    tensorflow-decision-forests==1.11.0 \
+    tf-keras==2.18.0 \
+    matplotlib \
+    protobuf==3.20.3 \
+    jax==0.5.2
+from google.colab import files
+import io
+import pandas as pd
+df = pd.read_csv('hopelink_psych_therapy_dataset.csv')
+
+
+
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.utils.class_weight import compute_class_weight
+from sklearn.metrics import classification_report
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import (
+    Input, LSTM, Dense, Dropout, Bidirectional,
+    Concatenate, BatchNormalization, Lambda, Multiply
+)
+from tensorflow.keras.preprocessing.sequence import pad_sequences
+from tensorflow.keras.utils import to_categorical
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+import tensorflow as tf
+
+# Feature engineering
+df["duration_diff"] = df["real_duration"] - df["assigned_duration"]
+df["acc_magnitude"] = np.sqrt(df["acc_x"]**2 + df["acc_y"]**2 + df["acc_z"]**2)
+
+# Encode categorical features
+df["gender"] = df["gender"].astype('category').cat.codes
+df["diagnostic_label"] = df["diagnostic_label"].astype('category').cat.codes
+if "activity_type" in df.columns:
+    df["activity_type"] = df["activity_type"].astype('category').cat.codes
+
+# Additional features
+df["hr_variance"] = df.groupby("activity_id")["heart_rate"].transform("std")
+df["duration_ratio"] = df["real_duration"] / (df["assigned_duration"] + 1e-5)
+df["flag_sum"] = df[["flag1", "flag2", "flag3"]].sum(axis=1)
+df.fillna(0, inplace=True)
+
+# Define features
+dynamic_feats = ["heart_rate", "acc_x", "acc_y", "acc_z", "gyro_x", "gyro_y", "gyro_z", "acc_magnitude"]
+static_feats = [
+    "age", "gender",  "diagnostic_label", "severity_score",
+    "feedback", "hr_variance", "duration_ratio", "duration_diff", "flag_sum", "assigned_duration"
+]
+if "activity_type" in df.columns:
+    static_feats.append("activity_type")
+
+# Normalize dynamic features
+scaler_dyn = StandardScaler()
+df[dynamic_feats] = scaler_dyn.fit_transform(df[dynamic_feats])
+
+# Build sequences
+activities = []
+for activity_id, grp in df.groupby("activity_id"):
+    dyn_seq = grp[dynamic_feats].values
+    activities.append({
+        "dynamic": dyn_seq,
+        "static": grp[static_feats].iloc[0].values,
+        "target": grp["correctness"].iloc[0]
+    })
+
+# Pad sequences
+max_len = max(len(a["dynamic"]) for a in activities)
+X_dyn = pad_sequences([a["dynamic"] for a in activities], maxlen=max_len, dtype="float32", padding="post")
+
+# Normalize static features
+X_stat_raw = np.array([a["static"] for a in activities])
+scaler_stat = StandardScaler()
+X_stat = scaler_stat.fit_transform(X_stat_raw)
+
+# Labels and splits
+y = np.array([a["target"] for a in activities])
+X_dyn_train, X_dyn_val, X_stat_train, X_stat_val, y_train, y_val = train_test_split(
+    X_dyn, X_stat, y, test_size=0.2, stratify=y, random_state=42
+)
+y_train_cat = to_categorical(y_train, num_classes=5)
+y_val_cat = to_categorical(y_val, num_classes=5)
+
+# Class weights
+class_weights = compute_class_weight(class_weight="balanced", classes=np.unique(y_train), y=y_train)
+class_weight_dict = dict(enumerate(class_weights))
+
+def softmax_fun(x):
+  return tf.nn.softmax(x, axis=1)
+
+def reduce_sum(x):
+  return tf.reduce_sum(x, axis=1)
+
+# Attention mechanism
+def attention_block(inputs):
+    attention_weights = Dense(1, activation='tanh')(inputs)
+    attention_weights = Lambda(softmax_fun)(attention_weights)
+    attention_output = Multiply()([inputs, attention_weights])
+    context_vector = Lambda(reduce_sum)(attention_output)
+    return context_vector
+
+# Build the model
+def build_model(max_len, n_features, static_dim):
+    inp_dyn = Input(shape=(max_len, n_features), name="dyn_input")
+    x = Bidirectional(LSTM(64, return_sequences=True))(inp_dyn)
+    x = Dropout(0.2)(x)
+    x = Bidirectional(LSTM(32, return_sequences=True))(x)
+    x = attention_block(x)
+
+    inp_stat = Input(shape=(static_dim,), name="static_input")
+    s = Dense(64, activation="relu")(inp_stat)
+    s = BatchNormalization()(s)
+    s = Dropout(0.15)(s)
+
+    merged = Concatenate()([x, s])
+    merged = BatchNormalization()(merged)
+    merged = Dense(64, activation="relu")(merged)
+    merged = Dropout(0.25)(merged)
+    out = Dense(5, activation="softmax")(merged)
+
+    return Model(inputs=[inp_dyn, inp_stat], outputs=out)
+
+# Compile model
+loss_fn = tf.keras.losses.CategoricalCrossentropy(label_smoothing=0.05)
+model = build_model(max_len, X_dyn.shape[2], X_stat.shape[1])
+model.compile(optimizer="adam", loss=loss_fn, metrics=["accuracy"])
+
+# Callbacks
+callbacks = [
+    EarlyStopping(patience=30, restore_best_weights=True),
+    ReduceLROnPlateau(patience=10, factor=0.3)
+]
+
+# Train
+history = model.fit(
+    [X_dyn_train, X_stat_train], y_train_cat,
+    validation_data=([X_dyn_val, X_stat_val], y_val_cat),
+    epochs=120,
+    batch_size=32,
+    callbacks=callbacks,
+    class_weight=class_weight_dict,
+    verbose=1
+)
+joblib.dump(X_dyn, "scaler_dyn.pkl")
+joblib.dump(X_stat, "scaler_stat.pkl")
+model.save("hopelink_lstm_model.h5")
+from tensorflow.keras.models import load_model
+from tensorflow.keras.preprocessing.sequence import pad_sequences
+import pandas as pd
+import numpy as np
+import joblib
+import joblib
+
+def softmax_fun(x):
+  return tf.nn.softmax(x, axis=1)
+
+def reduce_sum(x):
+  return tf.reduce_sum(x, axis=1)
+
+# Load model and scalers
+model = load_model("hopelink_lstm_model.h5", custom_objects={'softmax_fun': softmax_fun, 'reduce_sum': reduce_sum})
+
+df = pd.DataFrame([{"activity_id":1,"patient_id":100,"activity_type":"relaxation","age":23,"gender":"Female","diagnostic_label":None,"severity_score":3,"flag1":1,"flag2":1,"flag3":1,"feedback":3,"assigned_duration":0,"real_duration":10,"heart_rate":64,"acc_x":0.04271359821074231,"acc_y":0.5439773504125656,"acc_z":-0.5755908831579576,"gyro_x":0.2384358600828599,"gyro_y":-0.8199143326701809,"gyro_z":-0.8923446555791855,"correctness":0}])
+
+# Same preprocessing as training
+df["duration_diff"] = df["real_duration"] - df["assigned_duration"]
+df["acc_magnitude"] = np.sqrt(df["acc_x"]**2 + df["acc_y"]**2 + df["acc_z"]**2)
+df["gender"] = df["gender"].astype('category').cat.codes
+df["diagnostic_label"] = df["diagnostic_label"].astype('category').cat.codes
+if "activity_type" in df.columns:
+    df["activity_type"] = df["activity_type"].astype('category').cat.codes
+df["hr_variance"] = df.groupby("activity_id")["heart_rate"].transform("std")
+df["duration_ratio"] = df["real_duration"] / (df["assigned_duration"] + 1e-5)
+df["flag_sum"] = df[["flag1", "flag2", "flag3"]].sum(axis=1)
+df.fillna(0, inplace=True)
+
+# Feature columns
+dynamic_feats = ["heart_rate", "acc_x", "acc_y", "acc_z", "gyro_x", "gyro_y", "gyro_z", "acc_magnitude"]
+static_feats = ["age", "gender", "diagnostic_label", "severity_score", "feedback",
+                "hr_variance", "duration_ratio", "duration_diff", "flag_sum", "assigned_duration"]
+if "activity_type" in df.columns:
+    static_feats.append("activity_type")
+
+activities = []
+for activity_id, grp in df.groupby("activity_id"):
+    dyn_seq = grp[dynamic_feats].values
+    activities.append({
+        "dynamic": dyn_seq,
+        "static": grp[static_feats].iloc[0].values
+    })
+
+X_dyn = pad_sequences([activities[0]["dynamic"]], maxlen=30, dtype="float32", padding="post")
+X_stat_raw = np.array([activities[0]["static"]])
+
+# Predict
+predictions = model.predict([X_dyn, X_stat_raw])
+predicted_classes = np.argmax(predictions, axis=1)
+
+print("Predicted Classes:", predicted_classes)
+from google.colab import drive
+drive.mount('/content/drive')
+
+# Evaluate
+y_pred_prob = model.predict([X_dyn_val, X_stat_val])
+y_pred = np.argmax(y_pred_prob, axis=1)
+report = classification_report(
+    y_val, y_pred,
+    output_dict=True,
+    target_names=["very bad", "bad", "medium", "good", "very good"]
+)
+report_df = pd.DataFrame(report).transpose()
+print(report_df)
+from google.colab import files
+files.download("hopelink_lstm_model.h5")
+from sklearn.metrics import confusion_matrix
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+# Define string labels for class 0 to 4
+labels5 = ["very bad", "bad", "medium", "good", "very good"]
+
+# Compute the confusion matrix using integer labels 0-4
+cm = confusion_matrix(y_val, y_pred, labels=[0, 1, 2, 3, 4])
+
+# Plot the heatmap with string labels
+plt.figure(figsize=(6, 5))
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+            xticklabels=labels5, yticklabels=labels5)
+plt.xlabel('Predicted')
+plt.ylabel('True')
+plt.title('Confusion Matrix')
+plt.tight_layout()
+plt.show()
+import matplotlib.pyplot as plt
+
+epochs = list(range(1, 41))
+train_acc = history.history['accuracy'][:40]
+val_acc = history.history['val_accuracy'][:40]
+
+plt.figure(figsize=(9, 6))
+plt.plot(epochs, train_acc, label='Train Accuracy')
+plt.plot(epochs, val_acc, label='Validation Accuracy')
+plt.title('Model Accuracy Across Epochs (Epoch 1 to 40)')
+plt.xlabel('Epoch')
+plt.ylabel('Accuracy')
+plt.xticks(ticks=list(range(1, 41, 2)) + [40])  # Add epoch 40 explicitly
+plt.grid(True, linestyle='--', linewidth=0.5)
+plt.legend()
+plt.tight_layout()
+plt.savefig("training_curves_epoch1to40.png")
+plt.show()
+label_counts = df.groupby("correctness").size()
+
+plt.figure(figsize=(6, 4))
+label_counts.plot(kind='bar', color='#5DADE2', edgecolor='black')
+plt.title("Correctness Score Distribution")
+plt.xlabel("Correctness Label (0=Very Bad → 4=Very Good)")
+plt.ylabel("Number of Sessions")
+plt.xticks(rotation=0)
+plt.tight_layout()
+plt.savefig("dataset_distribution.png")
+plt.show()
